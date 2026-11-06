@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "foundry-tpm-tester"
+version = "0.1.0"
+description = "Bounded, observable TPM quota experiments for Azure OpenAI in Microsoft Foundry."
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.10,<4",
+    "azure-identity>=1.19,<2",
+    "httpx>=0.27,<1",
+    "tiktoken>=0.8,<1",
+]
+
+[project.scripts]
+foundry-tpm-test = "tpm_tester:main"
+
+[tool.setuptools]
+py-modules = ["tpm_tester"]

@@ -1,0 +1,15 @@
+{
+  "endpoint": "",
+  "deployment": "",
+  "quota_tpm": 30000,
+  "target_tokens": 45000,
+  "duration_seconds": 60,
+  "input_tokens": 2000,
+  "max_output_tokens": 64,
+  "concurrency": 4,
+  "timeout_seconds": 60,
+  "max_requests": 1000,
+  "encoding": "o200k_base",
+  "output_token_parameter": "max_completion_tokens",
+  "token_scope": "https://ai.azure.com/.default"
+}
