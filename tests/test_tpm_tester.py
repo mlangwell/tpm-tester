@@ -332,6 +332,11 @@ class LoadTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SummaryAndCliTests(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(contextlib.chdir(directory))
+        self.enterContext(patch.dict(os.environ, {}, clear=True))
+
     def result(self, number, started, **changes):
         values = {
             "request_number": number, "scheduled_seconds": started, "started_seconds": started,
@@ -374,6 +379,111 @@ class SummaryAndCliTests(unittest.TestCase):
             path.write_text('{"unknown_option": 1}')
             with self.assertRaisesRegex(ValueError, "Unknown configuration fields"):
                 suite.load_config(arguments)
+
+    def test_environment_file_provides_every_setting_without_modifying_process_environment(self):
+        Path(".env").write_text(
+            "\ufeff# Local configuration\n"
+            'AZURE_OPENAI_ENDPOINT="https://example.openai.azure.com"\n'
+            "AZURE_OPENAI_DEPLOYMENT='env-file-deployment'\n"
+            "TPM_QUOTA_TPM=30000\n"
+            "TPM_TARGET_TOKENS=60000\n"
+            "TPM_DURATION_SECONDS=30.5\n"
+            "TPM_INPUT_TOKENS=4000\n"
+            "TPM_MAX_OUTPUT_TOKENS=128\n"
+            "TPM_CONCURRENCY=2\n"
+            "TPM_TIMEOUT_SECONDS=12.5\n"
+            "TPM_MAX_REQUESTS=50\n"
+            "TPM_ENCODING=cl100k_base\n"
+            "TPM_OUTPUT_TOKEN_PARAMETER=max_tokens\n"
+            "TPM_TOKEN_SCOPE=https://cognitiveservices.azure.com/.default\n",
+            encoding="utf-8",
+        )
+        arguments = suite.parser_for_cli().parse_args(["--live"])
+        config = suite.load_config(arguments)
+        self.assertEqual(config, suite.Config(
+            endpoint="https://example.openai.azure.com",
+            deployment="env-file-deployment",
+            quota_tpm=30000,
+            target_tokens=60000,
+            duration_seconds=30.5,
+            input_tokens=4000,
+            max_output_tokens=128,
+            concurrency=2,
+            timeout_seconds=12.5,
+            max_requests=50,
+            encoding="cl100k_base",
+            output_token_parameter="max_tokens",
+            token_scope="https://cognitiveservices.azure.com/.default",
+        ))
+        self.assertNotIn("AZURE_OPENAI_ENDPOINT", os.environ)
+        self.assertNotIn("TPM_TARGET_TOKENS", os.environ)
+
+    def test_cli_process_environment_dotenv_and_json_precedence(self):
+        Path(".env").write_text(
+            "AZURE_OPENAI_DEPLOYMENT=dotenv-deployment\nTPM_TARGET_TOKENS=45000\n",
+        )
+        Path("config.json").write_text(json.dumps({
+            "deployment": "json-deployment", "target_tokens": 20000, "concurrency": 2,
+        }))
+        arguments = suite.parser_for_cli().parse_args(["--config", "config.json"])
+        config = suite.load_config(arguments)
+        self.assertEqual(config.deployment, "dotenv-deployment")
+        self.assertEqual(config.target_tokens, 45000)
+        self.assertEqual(config.concurrency, 2)
+        with patch.dict(os.environ, {"TPM_TARGET_TOKENS": "60000"}):
+            self.assertEqual(suite.load_config(arguments).target_tokens, 60000)
+            arguments = suite.parser_for_cli().parse_args([
+                "--config", "config.json", "--target-tokens", "75000",
+            ])
+            self.assertEqual(suite.load_config(arguments).target_tokens, 75000)
+
+    def test_invalid_numeric_environment_values_fail_explicitly(self):
+        arguments = suite.parser_for_cli().parse_args([])
+        for value in ("not-a-number", "", "45.5"):
+            with self.subTest(value=value), patch.dict(os.environ, {"TPM_TARGET_TOKENS": value}):
+                with self.assertRaisesRegex(ValueError, "TPM_TARGET_TOKENS must be a valid int"):
+                    suite.load_config(arguments)
+        Path(".env").write_text("TPM_TARGET_TOKENS=not-a-number\n")
+        with self.assertRaisesRegex(ValueError, "TPM_TARGET_TOKENS must be a valid int"):
+            suite.load_config(arguments)
+        override = suite.parser_for_cli().parse_args(["--target-tokens", "60000"])
+        self.assertEqual(suite.load_config(override).target_tokens, 60000)
+
+    def test_valueless_environment_file_setting_is_rejected(self):
+        Path(".env").write_text("TPM_TARGET_TOKENS\n")
+        arguments = suite.parser_for_cli().parse_args([])
+        with self.assertRaisesRegex(ValueError, "TPM_TARGET_TOKENS in .env must use NAME=value"):
+            suite.load_config(arguments)
+
+    def test_unreadable_environment_path_is_a_cli_error(self):
+        Path(".env").mkdir()
+        with contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as result:
+            suite.main(["--dry-run"])
+        self.assertEqual(result.exception.code, 2)
+        self.assertIn(".env", errors.getvalue())
+
+    def test_dry_run_uses_environment_file_without_model_calls(self):
+        Path(".env").write_text("TPM_TARGET_TOKENS=60000\n")
+        with (
+            patch.object(suite, "execute_live") as execute,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(suite.main(["--dry-run"]), 0)
+        execute.assert_not_called()
+        self.assertIn("60,000 offered prompt-text tokens", output.getvalue())
+
+    def test_environment_example_covers_all_configuration_fields(self):
+        template = Path(suite.__file__).with_name(".env.example").read_text(encoding="utf-8")
+        Path(".env").write_text(template, encoding="utf-8")
+        config = suite.load_config(suite.parser_for_cli().parse_args(["--live"]))
+        expected = replace(
+            suite.Config(),
+            endpoint="https://YOUR-RESOURCE.openai.azure.com",
+            deployment="YOUR-DEPLOYMENT-NAME",
+        )
+        self.assertEqual(config, expected)
+        file_values = suite.dotenv_values(".env")
+        self.assertEqual(len(file_values), len(asdict(config)))
 
     def test_jsonl_report_preserves_raw_errors_and_partial_progress(self):
         report = io.StringIO()

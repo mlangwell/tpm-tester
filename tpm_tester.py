@@ -1,4 +1,14 @@
-"""Observable, bounded Azure OpenAI TPM experiments with no automatic retries."""
+"""Test how an existing Azure OpenAI deployment responds to bounded token load.
+
+The program reads configuration, plans synthetic prompts, and prints that plan.
+Only --live starts authentication and sends potentially billable model requests.
+It never creates deployments, changes Azure quota, or retries rejected requests.
+
+Input-token targets describe attempted load, not accepted or billed usage.
+HTTP 429 responses are preserved as observations; their error bodies and headers
+help distinguish token limits, request limits, and service-capacity throttling.
+Start reading at Config for settings and main for the complete execution flow.
+"""
 
 from __future__ import annotations
 
@@ -20,19 +30,62 @@ import httpx
 import tiktoken
 from azure.core.exceptions import AzureError
 from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
+from dotenv import dotenv_values
 
+# Leave room for the instruction and unique marker inside every synthetic prompt.
 MIN_INPUT_TOKENS = 64
+# Calling this asynchronous provider obtains a bearer token, refreshing it if needed.
 TokenProvider = Callable[[], Awaitable[str]]
 Outcome = Literal["success", "throttled", "http_error", "transport_error", "invalid_response"]
 
 
 class Tokenizer(Protocol):
-    def encode(self, text: str) -> list[int]: ...
+    """Describe the tokenizer operations required to construct sized prompts.
 
-    def decode(self, tokens: Sequence[int]) -> str: ...
+    A Protocol describes an interface rather than a concrete tokenizer.
+    Live runs use tiktoken; offline tests can supply a deterministic substitute.
+    """
+
+    def encode(self, text: str) -> list[int]:
+        """Split text into the token IDs understood by this tokenizer.
+
+        Args:
+            text: Prompt text whose local token count is needed.
+
+        Returns:
+            Token IDs; their list length is the locally measured token count.
+        """
+        ...
+
+    def decode(self, tokens: Sequence[int]) -> str:
+        """Reconstruct prompt text from a chosen sequence of token IDs.
+
+        Args:
+            tokens: Token IDs, typically trimmed to the desired prompt size.
+
+        Returns:
+            Text that make_prompt will encode again to verify its exact size.
+        """
+        ...
 
 
 class ResponseDetails(TypedDict):
+    """Describe the dictionary extracted from an HTTP response.
+
+    TypedDict documents dictionary keys for type checking; it is not an Azure
+    response class. The request's timing and planned size are added separately.
+
+    Attributes:
+        outcome: success, throttled (HTTP 429), http_error, transport_error,
+            or invalid_response (an unusable HTTP-success response).
+        status_code: HTTP status, or None when no HTTP response was received.
+        headers: Lowercase diagnostic headers only, excluding credentials/cookies.
+        usage: Optional service-reported prompt_tokens, completion_tokens, and
+            total_tokens; present only when all three are nonnegative integers.
+        usage_warning: Optional explanation of missing or incomplete usage.
+        error: Optional original HTTP error body or transport/parsing description.
+    """
+
     outcome: Outcome
     status_code: int | None
     headers: dict[str, str]
@@ -43,6 +96,39 @@ class ResponseDetails(TypedDict):
 
 @dataclass(frozen=True)
 class Config:
+    """Hold the effective settings for one experiment.
+
+    This frozen dataclass is an immutable settings container. Its fields also
+    describe the arguments accepted by its generated constructor. These values
+    configure this client only; none of them update your deployment in Azure.
+
+    Attributes:
+        endpoint: HTTPS resource root, OpenAI v1 base URL, or full chat URL.
+            Read from AZURE_OPENAI_ENDPOINT; not a Foundry project URL.
+        deployment: Your Azure deployment name, not necessarily its model ID.
+            Read from AZURE_OPENAI_DEPLOYMENT.
+        quota_tpm: Assigned tokens-per-minute limit used for display/comparison.
+            The app neither retrieves nor changes the actual Azure allocation.
+        target_tokens: Total prompt-text tokens to attempt during the whole run.
+            Includes rejected attempts, but excludes output and message framing.
+        duration_seconds: Time window for starting requests, in seconds.
+            In-flight requests can finish after this window closes.
+        input_tokens: Maximum local prompt-text tokens in each request.
+            The planner balances request sizes to match target_tokens exactly.
+        max_output_tokens: Maximum output budget sent with each request.
+            It is not guaranteed output and is not included in target_tokens.
+        concurrency: Maximum number of requests that can be in flight together.
+            This is a ceiling, not the number of requests started each second.
+        timeout_seconds: Wall-clock timeout for an individual HTTP attempt.
+        max_requests: Safety ceiling for the total number of planned attempts.
+        encoding: tiktoken encoding used for local prompt construction/counting.
+            It should match your model; Azure's measured usage can still differ.
+        output_token_parameter: API field carrying the output cap:
+            max_completion_tokens, or max_tokens for compatible older models.
+        token_scope: Entra token audience, normally https://ai.azure.com/.default.
+            This is a scope string, not an access token or API key.
+    """
+
     endpoint: str = ""
     deployment: str = ""
     quota_tpm: int = 30_000
@@ -58,6 +144,16 @@ class Config:
     token_scope: str = "https://ai.azure.com/.default"
 
     def validate(self, *, live: bool) -> None:
+        """Reject invalid settings before workload planning or network activity.
+
+        Args:
+            live: Whether real model calls were requested. Endpoint/deployment
+                may be omitted for a dry run, but are required for a live run.
+
+        Raises:
+            ValueError: A value has an unsupported type, size, encoding, API
+                parameter name, scope, or endpoint format.
+        """
         for name in (
             "quota_tpm", "target_tokens", "input_tokens", "max_output_tokens",
             "concurrency", "max_requests",
@@ -90,12 +186,26 @@ class Config:
         if live and (not self.endpoint.strip() or not self.deployment.strip()):
             raise ValueError(
                 "Live tests require endpoint and deployment. Set AZURE_OPENAI_ENDPOINT "
-                "and AZURE_OPENAI_DEPLOYMENT, or configure them in the file/CLI."
+                "and AZURE_OPENAI_DEPLOYMENT in .env or your environment, "
+                "or configure them in the JSON file/CLI."
             )
         if self.endpoint:
             self.request_url()
 
     def request_url(self) -> str:
+        """Validate endpoint syntax and produce the chat-completions URL.
+
+        A resource root gains /openai/v1/chat/completions, a v1 base gains
+        /chat/completions, and an existing full chat URL is kept. This method
+        does not check whether the resource exists or whether you can access it.
+
+        Returns:
+            The HTTPS URL to which model inference requests will be posted.
+
+        Raises:
+            ValueError: The URL uses an unsupported scheme/path, embeds
+                credentials, or contains query parameters/fragments/whitespace.
+        """
         url = urlsplit(self.endpoint)
         allowed_paths = ("", "/openai/v1", "/openai/v1/chat/completions")
         if (
@@ -122,6 +232,20 @@ class Config:
 
 @dataclass(frozen=True)
 class Plan:
+    """Describe a proposed workload without sending requests.
+
+    Attributes:
+        prompt_tokens_per_request: Ordered local prompt sizes, one per attempt.
+        request_count: Number of model calls the run will try to dispatch.
+        total_prompt_tokens: Sum of planned input sizes; equals target_tokens.
+        maximum_generated_tokens: Sum of per-request output caps. This is only
+            an upper budget, not expected output, billed usage, or reserved TPM.
+        offered_prompt_tpm: Planned input tokens * 60 / dispatch-window seconds.
+            This is an average offered rate, not Azure's enforcement counter.
+        offered_rpm: Planned requests * 60 / dispatch-window seconds.
+            Azure also enforces request limits, including over short windows.
+    """
+
     prompt_tokens_per_request: tuple[int, ...]
     request_count: int
     total_prompt_tokens: int
@@ -132,6 +256,26 @@ class Plan:
 
 @dataclass(frozen=True)
 class RequestResult:
+    """Record one HTTP attempt after it has returned or failed.
+
+    Completed attempts can arrive out of request-number order. Requests that
+    were never dispatched, or were interrupted without a result, have no record.
+
+    Attributes:
+        request_number: One-based position in the original workload plan.
+        scheduled_seconds: Intended start offset from the load-test clock.
+        started_seconds: Actual start offset, just before the HTTP attempt.
+        latency_seconds: Elapsed time for the HTTP attempt and response parsing.
+        prompt_text_tokens: Local input-text token count, even if Azure rejects it.
+        max_output_tokens: Output cap requested, not actual generated tokens.
+        outcome: Classified result, such as success, throttled, or transport_error.
+        status_code: HTTP response status, or None for connection/timeout failures.
+        headers: Diagnostic rate-limit, retry, region, and request-ID headers.
+        usage: Valid service-reported token counts, or None when unavailable.
+        usage_warning: Why usage cannot be counted for an otherwise valid response.
+        error: Original HTTP failure body or a transport/parsing error description.
+    """
+
     request_number: int
     scheduled_seconds: float
     started_seconds: float
@@ -148,6 +292,31 @@ class RequestResult:
 
 @dataclass(frozen=True)
 class Summary:
+    """Summarize observed attempts without treating offered load as billed usage.
+
+    Attributes:
+        planned_requests: Number of attempts in the initial plan.
+        recorded_requests: Completed attempts, including throttling and failures.
+        not_completed_requests: Planned attempts without recorded results.
+            They may be unsent, or interrupted after reaching Azure.
+        succeeded: HTTP-success responses with a usable chat-completion envelope.
+        throttled: Attempts returning HTTP 429, regardless of its underlying cause.
+        failed: Other recorded HTTP, transport, or response-format failures.
+            Fatal startup/run errors are reported separately by main.
+        peak_60s_offered_prompt_tokens: Largest sum of recorded attempts' input
+            sizes started within any rolling 60-second window; includes rejections.
+        first_throttle_seconds: Start offset of the earliest attempt returning
+            HTTP 429, or None if none did; not the time its response arrived.
+        maximum_schedule_lag_seconds: Largest positive actual-minus-planned
+            start delay, showing whether the client fell behind its schedule.
+        elapsed_seconds: Latest recorded completion offset from the load clock;
+            excludes initial authentication/tokenizer setup and final reporting.
+        usage_reported_requests: Successful attempts with complete token usage.
+        usage_missing_requests: Successful attempts without complete token usage.
+        reported_usage: Sum of available prompt/completion/total usage, or None
+            if none was reported. Partial coverage is not the whole run's cost.
+    """
+
     planned_requests: int
     recorded_requests: int
     not_completed_requests: int
@@ -164,6 +333,23 @@ class Summary:
 
 
 def build_plan(config: Config) -> Plan:
+    """Divide the input target into bounded, nearly equal prompt sizes.
+
+    Request count is rounded up from target_tokens / input_tokens, but the
+    token total is not rounded up. Extra tokens are distributed one at a time
+    across the first requests. This performs arithmetic only, with no Azure calls.
+
+    Args:
+        config: Validated settings supplying the target, per-request size,
+            dispatch window, output cap, and request-count safety ceiling.
+
+    Returns:
+        A plan whose input sizes sum exactly to config.target_tokens.
+
+    Raises:
+        ValueError: The request ceiling would be exceeded, or the target cannot
+            be split while respecting both the minimum and maximum prompt size.
+    """
     count = (config.target_tokens + config.input_tokens - 1) // config.input_tokens
     if count > config.max_requests:
         raise ValueError(
@@ -188,6 +374,25 @@ def build_plan(config: Config) -> Plan:
 
 
 def make_prompt(encoder: Tokenizer, token_count: int, marker: str) -> str:
+    """Construct synthetic input containing exactly the requested local tokens.
+
+    The text starts with a unique marker and asks for only "OK", followed by
+    repetitive filler. The marker reduces shared-prefix caching across requests;
+    the instruction reduces expected output, but does not guarantee its length.
+    Azure can count tokens differently, including chat-message overhead.
+
+    Args:
+        encoder: Tokenizer that encodes/decodes the model's chosen local encoding.
+        token_count: Exact prompt-text size, including the marker and instruction.
+        marker: Unique run/request identifier placed early in the prompt.
+
+    Returns:
+        Prompt text verified by encoding it again after trimming/decoding.
+
+    Raises:
+        ValueError: The marker/instruction cannot fit, or a token round trip
+            cannot preserve the requested size with this tokenizer.
+    """
     prefix = f"Quota test {marker}. Reply only OK.\n"
     if len(encoder.encode(prefix)) > token_count:
         raise ValueError("The request marker exceeds the configured input token count.")
@@ -199,6 +404,16 @@ def make_prompt(encoder: Tokenizer, token_count: int, marker: str) -> str:
 
 
 def diagnostic_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Keep useful throttling diagnostics without copying every HTTP header.
+
+    Args:
+        headers: Response-header names and values, usually from httpx.
+
+    Returns:
+        Lowercase rate-limit, retry-after, request-ID, and region headers.
+        Authorization and cookie headers are not included. Missing diagnostic
+        headers remain absent rather than being invented.
+    """
     allowed = {
         "retry-after", "retry-after-ms", "x-ms-retry-after-ms",
         "apim-request-id", "x-request-id", "x-ms-request-id", "x-ms-region",
@@ -211,6 +426,20 @@ def diagnostic_headers(headers: Mapping[str, str]) -> dict[str, str]:
 
 
 def response_details(response: httpx.Response) -> ResponseDetails:
+    """Classify an HTTP response and extract diagnostics without retrying it.
+
+    HTTP 429 becomes throttled; other non-success statuses become http_error.
+    HTTP-success responses must contain nonempty chat choices. Missing usage
+    produces an explicit warning, not fabricated zero-token usage. Successful
+    generated answers are not retained, while error bodies are kept verbatim.
+
+    Args:
+        response: Completed HTTP response, whether successful or unsuccessful.
+
+    Returns:
+        Fields ready to include in RequestResult, without request timing/size.
+        A throttled result proves a 429 was observed, not that TPM caused it.
+    """
     details: ResponseDetails = {
         "outcome": "success",
         "status_code": response.status_code,
@@ -259,6 +488,28 @@ async def run_load(
     results: list[RequestResult],
     on_result: Callable[[RequestResult], None] | None = None,
 ) -> None:
+    """Dispatch paced requests with bounded concurrency and no application retries.
+
+    Authentication is checked before starting the timing clock. Each worker
+    claims one planned request at a time, waits for its intended start, builds
+    the prompt, and submits it once. Nothing new is submitted after the dispatch
+    window expires; existing HTTP calls can finish or reach their timeout.
+    Timeouts/network errors are recorded per attempt. Authentication or callback
+    failures propagate after outstanding worker tasks are cancelled and awaited.
+
+    Args:
+        config: Validated destination, timing, authentication scope, and limits.
+        plan: Prompt sizes and request count computed by build_plan.
+        encoder: Tokenizer used to create exactly sized synthetic prompt text.
+        client: Caller-owned asynchronous HTTP client; this function does not
+            close it. execute_live supplies the no-retry, no-redirect client.
+        token_provider: Awaitable bearer-token factory from Azure Identity.
+            Checked initially and called for each request to allow token refresh.
+        results: Caller-owned list appended to as attempts finish. Retains
+            completed observations even if a later attempt stops the run.
+        on_result: Optional synchronous callback for each appended observation;
+            the CLI uses it to write the report and print immediate diagnostics.
+    """
     await token_provider()
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -266,6 +517,12 @@ async def run_load(
     run_marker = uuid.uuid4().hex[:12]
 
     async def worker() -> None:
+        """Consume the shared plan iterator using the enclosing run's resources.
+
+        This closure takes no arguments: config, plan, encoder, client, token
+        provider, results, and callback come from run_load. Every claimed job is
+        attempted at most once; a 429 is recorded rather than backed off/retried.
+        """
         for number, prompt_tokens in jobs:
             scheduled = (number - 1) * config.duration_seconds / plan.request_count
             await asyncio.sleep(max(0, started + scheduled - loop.time()))
@@ -328,6 +585,20 @@ async def run_load(
 
 
 def summarize(plan: Plan, results: Sequence[RequestResult]) -> Summary:
+    """Compute completion counts, achieved offered load, timing, and known usage.
+
+    The rolling-window calculation uses actual request start offsets, not
+    response arrival times. Rejected requests count toward offered load, but
+    only successful responses with valid usage contribute to reported usage.
+
+    Args:
+        plan: Original workload, used to identify missing attempt records.
+        results: Completed observations, possibly out of order or incomplete.
+            This function does not modify their order or add missing records.
+
+    Returns:
+        Run totals that distinguish a complete experiment from an incomplete one.
+    """
     ordered = sorted(results, key=lambda result: result.started_seconds)
     left = running = peak = 0
     for result in ordered:
@@ -365,6 +636,18 @@ def summarize(plan: Plan, results: Sequence[RequestResult]) -> Summary:
 
 
 def result_exit_code(summary: Summary, *, expect_throttle: bool) -> int:
+    """Choose the outcome code for a run without a separate fatal/interruption.
+
+    Args:
+        summary: Counts of completed, failed, missing, and throttled attempts.
+        expect_throttle: Whether observing at least one HTTP 429 is required.
+            This does not require the service to identify TPM as the cause.
+
+    Returns:
+        1 for failed/missing attempts; otherwise 3 if a required 429 was absent;
+        otherwise 0. A 429 alone is an experimental result, not a program failure.
+        main handles configuration errors, fatal errors, and interruptions.
+    """
     if summary.failed or summary.not_completed_requests:
         return 1
     if expect_throttle and not summary.throttled:
@@ -373,11 +656,31 @@ def result_exit_code(summary: Summary, *, expect_throttle: bool) -> int:
 
 
 def write_event(report: TextIO, event_type: str, data: dict[str, object]) -> None:
+    """Append and flush one JSONL record so completed progress is preserved.
+
+    Args:
+        report: Writable UTF-8 text report opened by main; remains open afterward.
+        event_type: Record category: plan, request, fatal, or summary.
+        data: JSON-serializable fields for the record, without a type key.
+            Request errors may contain service-provided details; review before sharing.
+
+    Raises:
+        OSError: Writing/flushing the report fails.
+        TypeError: A field cannot be serialized as JSON.
+        ValueError: Data contains nonfinite numbers that JSON must not accept.
+    """
     report.write(json.dumps({"type": event_type, **data}, allow_nan=False) + "\n")
     report.flush()
 
 
 def print_result(result: RequestResult) -> None:
+    """Display one observation immediately, including any raw throttling error.
+
+    Args:
+        result: Completed attempt to print with its HTTP status, timing, local
+            prompt size, diagnostic headers, raw error, and optional usage warning.
+            Successful model answers are not part of this record.
+    """
     print(
         f"#{result.request_number:04d} {result.outcome} HTTP={result.status_code} "
         f"t={result.started_seconds:.3f}s latency={result.latency_seconds:.3f}s "
@@ -393,6 +696,16 @@ def print_result(result: RequestResult) -> None:
 
 
 def parser_for_cli() -> argparse.ArgumentParser:
+    """Define the command-line interface without reading config or calling Azure.
+
+    Config fields use matching hyphenated flags, such as --target-tokens.
+    --config selects JSON settings; --output selects a new report path.
+    --live explicitly authorizes model calls; --dry-run is the safe default.
+    --expect-throttle makes a complete run fail if no HTTP 429 was observed.
+
+    Returns:
+        The parser used by main; --help describes each CLI setting and exits.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, help="JSON configuration file.")
     mode = parser.add_mutually_exclusive_group()
@@ -424,7 +737,28 @@ def parser_for_cli() -> argparse.ArgumentParser:
 
 
 def load_config(arguments: argparse.Namespace) -> Config:
-    values = asdict(Config())
+    """Combine local settings in precedence order and validate the final values.
+
+    Highest to lowest priority: CLI, process environment, current directory's
+    .env, JSON file, built-in defaults. Endpoint/deployment use AZURE_OPENAI_
+    variable names; all other fields use TPM_ plus their uppercase field name.
+    Reading .env does not change os.environ, search parent folders, or acquire
+    Azure credentials. Numeric strings are converted to their setting's type.
+
+    Args:
+        arguments: Namespace produced by parser_for_cli, including an optional
+            config path, the live/dry-run choice, and explicit setting overrides.
+
+    Returns:
+        An immutable Config containing the effective values for this invocation.
+
+    Raises:
+        OSError: A requested JSON file or an existing .env cannot be read.
+        ValueError: JSON contains unknown fields, a selected environment value
+            is malformed, or the final configuration fails validation.
+    """
+    defaults = asdict(Config())
+    values = defaults.copy()
     if arguments.config is not None:
         with arguments.config.open(encoding="utf-8-sig") as file:
             supplied = json.load(file)
@@ -434,16 +768,33 @@ def load_config(arguments: argparse.Namespace) -> Config:
         if unknown:
             raise ValueError(f"Unknown configuration fields: {', '.join(sorted(unknown))}.")
         values.update(supplied)
-    for name, environment_variable in (
-        ("endpoint", "AZURE_OPENAI_ENDPOINT"),
-        ("deployment", "AZURE_OPENAI_DEPLOYMENT"),
-    ):
-        if environment_variable in os.environ:
-            values[name] = os.environ[environment_variable]
+    file_environment: Mapping[str, str | None] = {}
+    env_path = Path.cwd() / ".env"
+    if env_path.exists():
+        with env_path.open(encoding="utf-8-sig") as file:
+            file_environment = dotenv_values(stream=file, interpolate=False)
     for field in fields(Config):
         override = getattr(arguments, field.name)
         if override is not None:
             values[field.name] = override
+            continue
+        prefix = "AZURE_OPENAI_" if field.name in ("endpoint", "deployment") else "TPM_"
+        environment_variable = prefix + field.name.upper()
+        if environment_variable in os.environ:
+            raw_value = os.environ[environment_variable]
+        elif environment_variable in file_environment:
+            raw_value = file_environment[environment_variable]
+            if raw_value is None:
+                raise ValueError(f"{environment_variable} in .env must use NAME=value syntax.")
+        else:
+            continue
+        converter = type(defaults[field.name])
+        try:
+            values[field.name] = converter(raw_value)
+        except ValueError as error:
+            raise ValueError(
+                f"{environment_variable} must be a valid {converter.__name__}."
+            ) from error
     config = Config(**values)
     config.validate(live=arguments.live)
     return config
@@ -455,6 +806,21 @@ async def execute_live(
     results: list[RequestResult],
     on_result: Callable[[RequestResult], None],
 ) -> None:
+    """Open live-run resources, execute the load, and close them afterward.
+
+    This is the model-network path that main enters only with --live.
+    DefaultAzureCredential supplies Entra credentials (for example, az login),
+    not an API key. The HTTP transport has zero automatic retries and will not
+    follow redirects. First use of an encoding may download public tokenizer
+    data separately from model inference. Real inference can incur charges.
+
+    Args:
+        config: Validated destination, tokenizer, scope, and workload limits.
+        plan: Bounded prompt workload to pass to run_load.
+        results: Mutable list that receives completed attempts during the run.
+        on_result: Synchronous observer used to persist and display each result.
+            Errors from this callback are not silently ignored.
+    """
     encoder = tiktoken.get_encoding(config.encoding)
     async with DefaultAzureCredential(exclude_interactive_browser_credential=True) as credential:
         provider = get_bearer_token_provider(credential, config.token_scope)
@@ -467,6 +833,28 @@ async def execute_live(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the CLI from safe planning through optional live calls and reporting.
+
+    Always print the workload before any live operation. Dry runs stop there.
+    Live runs create a new report without overwriting existing files, collect
+    observations, and write a summary even after handled failures/interruption.
+    No Azure resource or quota-management operation is performed.
+
+    Args:
+        argv: CLI arguments without the executable name, such as ["--dry-run"].
+            None reads the actual process command line; useful for normal use,
+            while an explicit list lets offline tests exercise the same CLI.
+
+    Returns:
+        0 for a complete observation run; 1 for failures or missing results;
+        3 when --expect-throttle was requested but no 429 occurred; or 130 for
+        an interrupted live run. Live calls may already have reached Azure
+        before an interrupt, even if their response was not recorded.
+
+    Raises:
+        SystemExit: argparse handles --help and invalid arguments/configuration.
+            Invalid input exits with code 2 before any model calls are attempted.
+    """
     parser = parser_for_cli()
     arguments = parser.parse_args(argv)
     try:
@@ -503,6 +891,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             })
 
             def on_result(result: RequestResult) -> None:
+                """Persist and display an attempt already collected by run_load.
+
+                Args:
+                    result: Completed observation to add to the currently open
+                        report and print. The enclosing main supplies the report.
+                """
                 write_event(report, "request", asdict(result))
                 print_result(result)
 
